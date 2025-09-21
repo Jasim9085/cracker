@@ -16,7 +16,6 @@ jobs:
           ndk-version: r25c
           add-to-path: true
 
-      # --- Step 1: Create the structure and Makefiles for ndk-build ---
       - name: Create ndk-build project structure
         run: |
           mkdir -p jni/libpcap
@@ -28,22 +27,31 @@ jobs:
           echo "APP_PLATFORM := android-19" > jni/Application.mk
           echo "APP_ABI := armeabi-v7a arm64-v8a" >> jni/Application.mk
 
-      # --- Step 2: Build libpcap from source (still necessary) ---
+      # --- Build libpcap from source ---
       - name: Get and Build libpcap for all ABIs
         run: |
+          # Install build dependencies for libpcap
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake libtool byacc flex
+          
           git clone https://github.com/the-tcpdump-group/libpcap.git
           cd libpcap
-          # 32-bit
+          
+          # --- THIS IS THE MISSING STEP ---
+          ./autogen.sh
+          
+          # 32-bit build
           ./configure --host=arm-linux-androideabi --disable-shared --enable-static CC="clang --target=armv7a-linux-androideabi19"
           make
           cp libpcap.a ../jni/libpcap/libpcap-armeabi-v7a.a
-          # 64-bit
+          
+          # 64-bit build
           make clean
           ./configure --host=aarch64-linux-android --disable-shared --enable-static CC="clang --target=aarch64-linux-android21"
           make
           cp libpcap.a ../jni/libpcap/libpcap-arm64-v8a.a
 
-      # --- Step 3: Create the final Android.mk file ---
+      # --- Create the final Android.mk file ---
       - name: Create Android.mk
         run: |
           cat <<'EOF' > jni/Android.mk
@@ -55,7 +63,7 @@ jobs:
           LOCAL_SRC_FILES := native-lib.c
           include $(BUILD_SHARED_LIBRARY)
 
-          # --- Build libpcap as a prebuilt static library ---
+          # --- Link libpcap as a prebuilt static library ---
           include $(CLEAR_VARS)
           LOCAL_MODULE := libpcap-prebuilt
           LOCAL_SRC_FILES := libpcap/libpcap-$(TARGET_ARCH_ABI).a
@@ -69,26 +77,23 @@ jobs:
           include $(BUILD_EXECUTABLE)
           EOF
 
-      # --- Step 4: Run ndk-build ---
-      # This single command builds everything correctly for all architectures.
+      # --- Run ndk-build ---
       - name: Run ndk-build
         run: ndk-build NDK_PROJECT_PATH=.
 
-      # --- Step 5: Prepare Artifacts from the new output locations ---
+      # --- Prepare Artifacts ---
       - name: Prepare Artifacts
         run: |
           mkdir -p artifacts/libs/armeabi-v7a
           mkdir -p artifacts/libs/arm64-v8a
           mkdir -p artifacts/assets/armeabi-v7a
           mkdir -p artifacts/assets/arm64-v8a
-          # Shared libraries are in libs/
           cp libs/armeabi-v7a/libcracker.so artifacts/libs/armeabi-v7a/
           cp libs/arm64-v8a/libcracker.so artifacts/libs/arm64-v8a/
-          # Executables are in obj/local/
           cp obj/local/armeabi-v7a/wifi_scanner artifacts/assets/armeabi-v7a/
           cp obj/local/arm64-v8a/wifi_scanner artifacts/assets/arm64-v8a/
           
-      # --- Step 6: Upload the final artifacts ---
+      # --- Upload the final artifacts ---
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
