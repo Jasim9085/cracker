@@ -1,4 +1,4 @@
-name: Build Android Native Binaries (ndk-build + CMake)
+name: Build Android Native Binaries
 
 on: [push]
 
@@ -16,10 +16,10 @@ jobs:
           ndk-version: r25c
           add-to-path: true
 
-      # --- Step 1: Create the structure and Makefiles for ndk-build ---
+      # --- Create the structure for ndk-build ---
       - name: Create ndk-build project structure
         run: |
-          mkdir -p jni
+          mkdir -p jni/libpcap
           cp src/main/cpp/native-lib.c jni/
           cp src/main/cpp/wifi_scanner.c jni/
 
@@ -27,34 +27,37 @@ jobs:
         run: |
           echo "APP_PLATFORM := android-19" > jni/Application.mk
           echo "APP_ABI := armeabi-v7a arm64-v8a" >> jni/Application.mk
-          # Use Clang and the C++ standard library needed for CMake
-          echo "NDK_TOOLCHAIN_VERSION := clang" >> jni/Application.mk
           echo "APP_STL := c++_static" >> jni/Application.mk
 
-      # --- Step 2: Build libpcap from source using CMake (The Correct Way) ---
-      - name: Get and Build libpcap for all ABIs via CMake
+      # --- Build libpcap from source using CMake (The Correct Way) ---
+      - name: Get libpcap source
+        run: git clone https://github.com/the-tcpdump-group/libpcap.git
+
+      - name: Build libpcap for 32-bit (armeabi-v7a)
         run: |
-          git clone https://github.com/the-tcpdump-group/libpcap.git
           cd libpcap
-          mkdir build && cd build
-          
-          # Configure and Build for 32-bit and 64-bit
+          mkdir build-32 && cd build-32
           cmake .. \
             -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI="armeabi-v7a;arm64-v8a" \
+            -DANDROID_ABI="armeabi-v7a" \
+            -DANDROID_PLATFORM=android-19 \
+            -DENABLE_REMOTE=OFF
+          make
+          cp libpcap.a ../../jni/libpcap/libpcap-armeabi-v7a.a
+
+      - name: Build libpcap for 64-bit (arm64-v8a)
+        run: |
+          cd libpcap
+          mkdir build-64 && cd build-64
+          cmake .. \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI="arm64-v8a" \
             -DANDROID_PLATFORM=android-21 \
             -DENABLE_REMOTE=OFF
           make
+          cp libpcap.a ../../jni/libpcap/libpcap-arm64-v8a.a
           
-          # Copy the compiled static libraries
-          cp libpcap.a ../../jni/libpcap-armeabi-v7a.a
-          # For 64-bit, CMake puts it in a subdirectory
-          cp arm64-v8a/libpcap.a ../../jni/libpcap-arm64-v8a.a
-          # Copy headers
-          cp pcap.h ../../jni/
-          cp pcap/pcap.h ../../jni/
-
-      # --- Step 3: Create the final Android.mk file ---
+      # --- Create the final Android.mk file ---
       - name: Create Android.mk
         run: |
           cat <<'EOF' > jni/Android.mk
@@ -69,8 +72,9 @@ jobs:
           # --- Link libpcap as a prebuilt static library ---
           include $(CLEAR_VARS)
           LOCAL_MODULE := libpcap-prebuilt
-          LOCAL_SRC_FILES := libpcap-$(TARGET_ARCH_ABI).a
-          LOCAL_EXPORT_C_INCLUDES := $(LOCAL_PATH)
+          LOCAL_SRC_FILES := libpcap/libpcap-$(TARGET_ARCH_ABI).a
+          # We need to tell the scanner where to find the pcap.h header
+          LOCAL_EXPORT_C_INCLUDES := $(LOCAL_PATH)/../libpcap
           include $(PREBUILT_STATIC_LIBRARY)
 
           # --- Build wifi_scanner executable ---
@@ -81,11 +85,11 @@ jobs:
           include $(BUILD_EXECUTABLE)
           EOF
 
-      # --- Step 4: Run ndk-build ---
+      # --- Run ndk-build ---
       - name: Run ndk-build
         run: ndk-build NDK_PROJECT_PATH=.
 
-      # --- Step 5: Prepare Artifacts ---
+      # --- Prepare Artifacts ---
       - name: Prepare Artifacts
         run: |
           mkdir -p artifacts/libs/armeabi-v7a
@@ -97,7 +101,7 @@ jobs:
           cp obj/local/armeabi-v7a/wifi_scanner artifacts/assets/armeabi-v7a/
           cp obj/local/arm64-v8a/wifi_scanner artifacts/assets/arm64-v8a/
           
-      # --- Step 6: Upload the final artifacts ---
+      # --- Upload the final artifacts ---
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
