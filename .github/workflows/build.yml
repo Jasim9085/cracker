@@ -1,109 +1,94 @@
-# Name for this GitHub Actions workflow
-name: Build Android Native Binaries
+name: Build Android Native Binaries (ndk-build)
 
-# Trigger this workflow on every 'push' to any branch
 on: [push]
 
 jobs:
   build-native-code:
-    # Use the latest version of Ubuntu for the build environment
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Check out your repository's code
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # Step 2: Set up the Android NDK environment
       - name: Set up Android NDK
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r25c
           add-to-path: true
 
-      # Step 3: Create a directory for the build output
-      - name: Create build directory
-        run: mkdir build
-
-      # --- THIS IS THE CRITICAL FIX ---
-      # Define the GCC toolchain path for the linker
-      - name: Define GCC Toolchain Path
-        run: echo "GCC_TOOLCHAIN_PATH=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/lib64/clang/14.0.7/lib/linux" >> $GITHUB_ENV
-
-      # --- Build libcracker (Shared Library) ---
-      - name: Build libcracker.so for 32-bit (armeabi-v7a)
+      # --- Step 1: Create the structure and Makefiles for ndk-build ---
+      - name: Create ndk-build project structure
         run: |
-          clang -shared -fPIC \
-          -o build/libcracker-32.so \
-          src/main/cpp/native-lib.c \
-          --target=armv7a-linux-androideabi19 \
-          --sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
-          -L${{ env.GCC_TOOLCHAIN_PATH }}/arm
+          mkdir -p jni/libpcap
+          cp src/main/cpp/native-lib.c jni/
+          cp src/main/cpp/wifi_scanner.c jni/
 
-      - name: Build libcracker.so for 64-bit (arm64-v8a)
+      - name: Create Application.mk
         run: |
-          clang -shared -fPIC \
-          -o build/libcracker-64.so \
-          src/main/cpp/native-lib.c \
-          --target=aarch64-linux-android21 \
-          --sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
-          -L${{ env.GCC_TOOLCHAIN_PATH }}/aarch64
+          echo "APP_PLATFORM := android-19" > jni/Application.mk
+          echo "APP_ABI := armeabi-v7a arm64-v8a" >> jni/Application.mk
 
-      # --- Build libpcap dependency (Static Library) ---
-      - name: Get and Build libpcap for 32-bit (Static)
+      # --- Step 2: Build libpcap from source (still necessary) ---
+      - name: Get and Build libpcap for all ABIs
         run: |
           git clone https://github.com/the-tcpdump-group/libpcap.git
           cd libpcap
-          ./configure --host=arm-linux-androideabi --disable-shared --enable-static \
-          CC="clang --target=armv7a-linux-androideabi19 --sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot" \
-          LDFLAGS="-L${{ env.GCC_TOOLCHAIN_PATH }}/arm"
+          # 32-bit
+          ./configure --host=arm-linux-androideabi --disable-shared --enable-static CC="clang --target=armv7a-linux-androideabi19"
           make
-          cp libpcap.a ../build/libpcap-32.a
-
-      - name: Get and Build libpcap for 64-bit (Static)
-        run: |
-          cd libpcap
+          cp libpcap.a ../jni/libpcap/libpcap-armeabi-v7a.a
+          # 64-bit
           make clean
-          ./configure --host=aarch64-linux-android --disable-shared --enable-static \
-          CC="clang --target=aarch64-linux-android21 --sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot" \
-          LDFLAGS="-L${{ env.GCC_TOOLCHAIN_PATH }}/aarch64"
+          ./configure --host=aarch64-linux-android --disable-shared --enable-static CC="clang --target=aarch64-linux-android21"
           make
-          cp libpcap.a ../build/libpcap-64.a
-          
-      # --- Build wifi_scanner (Standalone Executable) ---
-      - name: Build wifi_scanner for 32-bit (Static)
-        run: |
-          clang -static -o build/wifi_scanner_32 \
-          src/main/cpp/wifi_scanner.c \
-          --target=armv7a-linux-androideabi19 \
-          --sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
-          -I./libpcap \
-          -L${{ env.GCC_TOOLCHAIN_PATH }}/arm \
-          build/libpcap-32.a
+          cp libpcap.a ../jni/libpcap/libpcap-arm64-v8a.a
 
-      - name: Build wifi_scanner for 64-bit (Static)
+      # --- Step 3: Create the final Android.mk file ---
+      - name: Create Android.mk
         run: |
-          clang -static -o build/wifi_scanner_64 \
-          src/main/cpp/wifi_scanner.c \
-          --target=aarch64-linux-android21 \
-          --sysroot=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot \
-          -I./libpcap \
-          -L${{ env.GCC_TOOLCHAIN_PATH }}/aarch64 \
-          build/libpcap-64.a
+          cat <<'EOF' > jni/Android.mk
+          LOCAL_PATH := $(call my-dir)
 
-      # --- Prepare the final directory structure for AIDE ---
+          # --- Build libcracker.so ---
+          include $(CLEAR_VARS)
+          LOCAL_MODULE    := cracker
+          LOCAL_SRC_FILES := native-lib.c
+          include $(BUILD_SHARED_LIBRARY)
+
+          # --- Build libpcap as a prebuilt static library ---
+          include $(CLEAR_VARS)
+          LOCAL_MODULE := libpcap-prebuilt
+          LOCAL_SRC_FILES := libpcap/libpcap-$(TARGET_ARCH_ABI).a
+          include $(PREBUILT_STATIC_LIBRARY)
+
+          # --- Build wifi_scanner executable ---
+          include $(CLEAR_VARS)
+          LOCAL_MODULE    := wifi_scanner
+          LOCAL_SRC_FILES := wifi_scanner.c
+          LOCAL_STATIC_LIBRARIES := libpcap-prebuilt
+          include $(BUILD_EXECUTABLE)
+          EOF
+
+      # --- Step 4: Run ndk-build ---
+      # This single command builds everything correctly for all architectures.
+      - name: Run ndk-build
+        run: ndk-build NDK_PROJECT_PATH=.
+
+      # --- Step 5: Prepare Artifacts from the new output locations ---
       - name: Prepare Artifacts
         run: |
           mkdir -p artifacts/libs/armeabi-v7a
           mkdir -p artifacts/libs/arm64-v8a
           mkdir -p artifacts/assets/armeabi-v7a
           mkdir -p artifacts/assets/arm64-v8a
-          mv build/libcracker-32.so artifacts/libs/armeabi-v7a/libcracker.so
-          mv build/libcracker-64.so artifacts/libs/arm64-v8a/libcracker.so
-          mv build/wifi_scanner_32 artifacts/assets/armeabi-v7a/wifi_scanner
-          mv build/wifi_scanner_64 artifacts/assets/arm64-v8a/wifi_scanner
-
-      # --- Upload the final 'artifacts' folder as a downloadable ZIP file ---
+          # Shared libraries are in libs/
+          cp libs/armeabi-v7a/libcracker.so artifacts/libs/armeabi-v7a/
+          cp libs/arm64-v8a/libcracker.so artifacts/libs/arm64-v8a/
+          # Executables are in obj/local/
+          cp obj/local/armeabi-v7a/wifi_scanner artifacts/assets/armeabi-v7a/
+          cp obj/local/arm64-v8a/wifi_scanner artifacts/assets/arm64-v8a/
+          
+      # --- Step 6: Upload the final artifacts ---
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4
         with:
