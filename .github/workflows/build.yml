@@ -1,0 +1,103 @@
+# Name for this GitHub Actions workflow
+name: Build Android Native Binaries
+
+# Trigger this workflow on every 'push' to any branch
+on: [push]
+
+jobs:
+  build-native-code:
+    # Use the latest version of Ubuntu for the build environment
+    runs-on: ubuntu-latest
+
+    steps:
+      # Step 1: Check out your repository's code
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # Step 2: Set up the Android NDK environment
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r25c # A stable, modern NDK version
+          add-to-path: true
+
+      # Step 3: Create a directory for the build output
+      - name: Create build directory
+        run: mkdir build
+
+      # --- Build libcracker (Shared Library) ---
+      - name: Build libcracker.so for 32-bit (armeabi-v7a)
+        run: |
+          clang -shared -fPIC \
+          -o build/libcracker-32.so \
+          src/main/cpp/native-lib.c \
+          --target=armv7a-linux-androideabi19
+
+      - name: Build libcracker.so for 64-bit (arm64-v8a)
+        run: |
+          clang -shared -fPIC \
+          -o build/libcracker-64.so \
+          src/main/cpp/native-lib.c \
+          --target=aarch64-linux-android21
+
+      # --- Build libpcap dependency (Static Library) ---
+      - name: Get and Build libpcap for 32-bit (Static)
+        run: |
+          git clone https://github.com/the-tcpdump-group/libpcap.git
+          cd libpcap
+          ./configure --host=arm-linux-androideabi --disable-shared --enable-static \
+          CC="clang --target=armv7a-linux-androideabi19"
+          make
+          # Copy the static library to our build folder for easy access
+          cp libpcap.a ../build/libpcap-32.a
+          # Copy the headers for our scanner to find pcap.h
+          cp pcap.h ../build/pcap-32.h
+          cp pcap-bpf.h ../build/pcap-bpf-32.h
+
+
+      - name: Get and Build libpcap for 64-bit (Static)
+        run: |
+          cd libpcap
+          make clean
+          ./configure --host=aarch64-linux-android --disable-shared --enable-static \
+          CC="clang --target=aarch64-linux-android21"
+          make
+          cp libpcap.a ../build/libpcap-64.a
+          cp pcap.h ../build/pcap-64.h
+          cp pcap-bpf.h ../build/pcap-bpf-64.h
+          
+      # --- Build wifi_scanner (Standalone Executable) ---
+      - name: Build wifi_scanner for 32-bit (Static)
+        run: |
+          clang -static -o build/wifi_scanner_32 \
+          src/main/cpp/wifi_scanner.c \
+          --target=armv7a-linux-androideabi19 \
+          -I./build \
+          build/libpcap-32.a
+
+      - name: Build wifi_scanner for 64-bit (Static)
+        run: |
+          clang -static -o build/wifi_scanner_64 \
+          src/main/cpp/wifi_scanner.c \
+          --target=aarch64-linux-android21 \
+          -I./build \
+          build/libpcap-64.a
+
+      # --- Prepare the final directory structure for AIDE ---
+      - name: Prepare Artifacts
+        run: |
+          mkdir -p artifacts/libs/armeabi-v7a
+          mkdir -p artifacts/libs/arm64-v8a
+          mkdir -p artifacts/assets/armeabi-v7a
+          mkdir -p artifacts/assets/arm64-v8a
+          mv build/libcracker-32.so artifacts/libs/armeabi-v7a/libcracker.so
+          mv build/libcracker-64.so artifacts/libs/arm64-v8a/libcracker.so
+          mv build/wifi_scanner_32 artifacts/assets/armeabi-v7a/wifi_scanner
+          mv build/wifi_scanner_64 artifacts/assets/arm64-v8a/wifi_scanner
+
+      # --- Upload the final 'artifacts' folder as a downloadable ZIP file ---
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-binaries
+          path: artifacts/
