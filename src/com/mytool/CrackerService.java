@@ -2,6 +2,7 @@ package com.mytool;
 
 import android.app.Service;
 import android.content.Intent;
+import android.os.Build;
 import android.os.IBinder;
 import android.os.Handler;
 import android.os.Looper;
@@ -12,35 +13,34 @@ import android.bluetooth.BluetoothServerSocket;
 import android.bluetooth.BluetoothSocket;
 import java.io.BufferedReader;
 import java.io.DataOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.io.PrintWriter;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.UUID;
 
 public class CrackerService extends Service {
 
     private static final String TAG = "CrackerService";
     private static final String APP_NAME = "MyTool";
-
-    // --- THIS IS THE FIX ---
-    // We are now using the standard, universal Serial Port Profile (SPP) UUID.
-    // All Bluetooth terminal apps are designed to connect to this UUID by default.
-    private static final UUID MY_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB");
-
+    private static final UUID MY_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB"); // Standard SPP UUID
     private volatile boolean isRunning = true;
-    private BluetoothServerThread serverThread; 
+    private BluetoothServerThread serverThread;
     private Handler mainThreadHandler;
     private BluetoothAdapter bluetoothAdapter;
+    private String scannerExecutablePath;
 
     @Override
     public void onCreate() {
         super.onCreate();
         mainThreadHandler = new Handler(Looper.getMainLooper());
-        showToast("Service Created.", false);
-
+        
         try {
+            prepareScannerExecutable(); // Prepare C tool first
+            
             bluetoothAdapter = BluetoothAdapter.getDefaultAdapter();
             if (bluetoothAdapter == null) {
                 showToast("FATAL: Bluetooth not supported.", true);
@@ -50,79 +50,80 @@ public class CrackerService extends Service {
             if (!bluetoothAdapter.isEnabled()) {
                 showToast("ERROR: Bluetooth is not enabled.", true);
             }
-
+            
             serverThread = new BluetoothServerThread();
             serverThread.start();
-        } catch (SecurityException e) {
-            showToast("FATAL: Service needs BLUETOOTH permission! Grant it in App Info.", true);
-            stopSelf();
-        } catch (Exception e) {
-            showToast("FATAL in onCreate: " + e.getMessage(), true);
+        } catch (Throwable t) {
+            showToast("FATAL in onCreate: " + t.getMessage(), true);
             stopSelf();
         }
     }
 
-    private class BluetoothServerThread extends Thread {
-        private BluetoothServerSocket bluetoothServerSocket;
+    private void prepareScannerExecutable() throws IOException {
+        String abi = Build.CPU_ABI;
+        Log.d(TAG, "Device ABI: " + abi);
+        
+        String assetPath;
+        if (abi.startsWith("arm64")) {
+            assetPath = "arm64-v8a/wifi_scanner";
+        } else {
+            assetPath = "armeabi-v7a/wifi_scanner";
+        }
+        
+        File outFile = new File(getFilesDir(), "wifi_scanner");
+        scannerExecutablePath = outFile.getAbsolutePath();
 
-        @Override
+        InputStream in = getAssets().open(assetPath);
+        OutputStream out = new FileOutputStream(outFile);
+        byte[] buffer = new byte[1024];
+        int read;
+        while ((read = in.read(buffer)) != -1) {
+            out.write(buffer, 0, read);
+        }
+        in.close();
+        out.flush();
+        out.close();
+
+        outFile.setExecutable(true, false);
+    }
+
+    private class BluetoothServerThread extends Thread {
+        private BluetoothServerSocket serverSocket;
         public void run() {
             try {
-                bluetoothServerSocket = bluetoothAdapter.listenUsingInsecureRfcommWithServiceRecord(APP_NAME, MY_UUID);
+                serverSocket = bluetoothAdapter.listenUsingInsecureRfcommWithServiceRecord(APP_NAME, MY_UUID);
                 showToast("Bluetooth server listening...", true);
-
                 while (isRunning) {
                     try {
-                        BluetoothSocket clientSocket = bluetoothServerSocket.accept();
-                        showToast("Bluetooth client accepted!", false);
-                        new Thread(new RobustClientHandler(clientSocket)).start();
+                        BluetoothSocket clientSocket = serverSocket.accept();
+                        new Thread(new ClientHandler(clientSocket)).start();
                     } catch (IOException e) {
                         if (!isRunning) break;
-                        showToast("Accept() failed. Ready for next client.", true);
                     }
                 }
             } catch (IOException e) {
                 showToast("FATAL: Bluetooth listen() failed: " + e.getMessage(), true);
             }
         }
-
         public void cancel() {
             try {
-                if (bluetoothServerSocket != null) {
-                    bluetoothServerSocket.close();
-                }
-            } catch (IOException e) { 
-                Log.e(TAG, "Could not close Bluetooth server socket", e);
-            }
+                if (serverSocket != null) serverSocket.close();
+            } catch (IOException e) { /* ignore */ }
         }
     }
 
-    private class RobustClientHandler implements Runnable {
+    private class ClientHandler implements Runnable {
         private BluetoothSocket clientSocket;
-
-        public RobustClientHandler(BluetoothSocket socket) {
-            this.clientSocket = socket;
-        }
+        public ClientHandler(BluetoothSocket socket) { this.clientSocket = socket; }
 
         @Override
         public void run() {
             PrintWriter output = null;
             BufferedReader input = null;
             try {
-                try {
-                    output = new PrintWriter(clientSocket.getOutputStream(), true);
-                    output.println("WELCOME"); // Acknowledge connection
-                } catch (Throwable t) {
-                    showToast("CRASH: GetOutputStream failed: " + t.getMessage(), true);
-                    return;
-                }
-
-                try {
-                    input = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
-                } catch (Throwable t) {
-                    showToast("CRASH: GetInputStream failed: " + t.getMessage(), true);
-                    return;
-                }
+                output = new PrintWriter(clientSocket.getOutputStream(), true);
+                input = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
+                output.println("WELCOME");
 
                 String command;
                 while (isRunning && (command = input.readLine()) != null) {
@@ -135,82 +136,47 @@ public class CrackerService extends Service {
                     }
                 }
             } catch (Throwable t) {
-                showToast("CRASH in command loop: " + t.getMessage(), true);
+                Log.e(TAG, "ClientHandler CRASHED", t);
             } finally {
                 try {
                     if (clientSocket != null) clientSocket.close();
                 } catch (IOException e) { /* ignore */ }
-                showToast("Client disconnected.", false);
             }
         }
     }
 
     private void handleScanCommand(PrintWriter clientOutput) {
-        clientOutput.println("Attempting scan with 'iw' tool first...");
-        List<String> foundSsids = new ArrayList<String>();
+        Process process = null;
         try {
-            Process process = Runtime.getRuntime().exec("su");
+            process = Runtime.getRuntime().exec("su");
             DataOutputStream os = new DataOutputStream(process.getOutputStream());
+            // Get BOTH streams
             BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()));
-            os.writeBytes("iw wlan0 scan\n");
+            BufferedReader errorReader = new BufferedReader(new InputStreamReader(process.getErrorStream()));
+            
+            os.writeBytes(scannerExecutablePath + "\n");
             os.flush();
             os.writeBytes("exit\n");
             os.flush();
+
             String line;
+            // Read standard output (the results) from the C program
             while ((line = reader.readLine()) != null) {
-                if (line.trim().startsWith("SSID:")) {
-                    foundSsids.add(line.trim().substring(5).trim());
-                }
+                clientOutput.println(line); // Send to client
             }
+            // Read standard error (the debug/error messages)
+            while ((line = errorReader.readLine()) != null) {
+                clientOutput.println("DEBUG: " + line); // Send to client, prefixed with DEBUG
+            }
+
             process.waitFor();
-            process.destroy();
+            clientOutput.println("--- SCAN FINISHED ---");
+
         } catch (Exception e) {
-            clientOutput.println("'iw' command failed: " + e.getMessage());
-        }
-
-        if (foundSsids.isEmpty()) {
-            clientOutput.println("Fallback: Attempting scan with 'wpa_cli' tool...");
-            try {
-                Process p1 = Runtime.getRuntime().exec("su");
-                DataOutputStream os1 = new DataOutputStream(p1.getOutputStream());
-                os1.writeBytes("wpa_cli -i wlan0 scan\n");
-                os1.flush();
-                os1.writeBytes("exit\n");
-                os1.flush();
-                p1.waitFor();
-                p1.destroy();
-                Thread.sleep(3000);
-                Process p2 = Runtime.getRuntime().exec("su");
-                DataOutputStream os2 = new DataOutputStream(p2.getOutputStream());
-                BufferedReader reader2 = new BufferedReader(new InputStreamReader(p2.getInputStream()));
-                os2.writeBytes("wpa_cli -i wlan0 scan_results\n");
-                os2.flush();
-                os2.writeBytes("exit\n");
-                os2.flush();
-                String line;
-                reader2.readLine();
-                while ((line = reader2.readLine()) != null)
-                {
-                    String[] parts = line.split("\t");
-                    if (parts.length > 3) {
-                        foundSsids.add(parts[parts.length - 1]);
-                    }
-                }
-                p2.waitFor();
-                p2.destroy();
-            } catch (Exception e) {
-                clientOutput.println("FATAL: Both 'iw' and 'wpa_cli' failed: " + e.getMessage());
-                showToast("Scan Error: " + e.getMessage(), true);
-                return;
-            }
-        }
-
-        if (foundSsids.isEmpty()) {
-            clientOutput.println("Scan finished. No networks found.");
-        } else {
-            clientOutput.println("Scan finished. Found Networks:");
-            for (String ssid : foundSsids) {
-                clientOutput.println("- " + ssid);
+            clientOutput.println("FATAL JAVA ERROR: " + e.getMessage());
+        } finally {
+            if (process != null) {
+                process.destroy();
             }
         }
     }
@@ -234,13 +200,13 @@ public class CrackerService extends Service {
     public IBinder onBind(Intent intent) {
         return null;
     }
-
+    
     private void showToast(final String message, final boolean isLong) {
         mainThreadHandler.post(new Runnable() {
-				@Override
-				public void run() {
-					Toast.makeText(CrackerService.this, message, isLong ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT).show();
-				}
-			});
+            @Override
+            public void run() {
+                Toast.makeText(CrackerService.this, message, isLong ? Toast.LENGTH_LONG : Toast.LENGTH_SHORT).show();
+            }
+        });
     }
 }
